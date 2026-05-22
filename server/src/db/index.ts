@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import { Database } from 'sqlite-napi';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -8,16 +8,29 @@ import { initEncryptionKey } from '../lib/crypto.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
 
-let db: Database.Database;
-
-export function getDb(): Database.Database {
+let db: Database;
+/**
+ * commit or rollback
+ */
+export function runInTransaction<T>(dbInstance: Database, cb: (tx: any) => T): T {
+  const tx = dbInstance.transaction();
+  try {
+    const result = cb(tx);
+    tx.commit();
+    return result;
+  } catch (error) {
+    tx.rollback();
+    throw error;
+  }
+}
+export function getDb(): Database {
   if (!db) {
     throw new Error('Database not initialized. Call initDb() first.');
   }
   return db;
 }
 
-export function initDb(dbPath?: string): Database.Database {
+export function initDb(dbPath?: string): Database {
   const resolvedPath = dbPath ?? DB_PATH;
   const isMemory = resolvedPath === ':memory:';
 
@@ -52,7 +65,7 @@ export function initDb(dbPath?: string): Database.Database {
   return db;
 }
 
-function createTables(db: Database.Database) {
+function createTables(db: Database) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,11 +129,11 @@ function createTables(db: Database.Database) {
   `);
 }
 
-function seedModels(db: Database.Database) {
-  const count = db.prepare('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
+function seedModels(db: Database) {
+  const count = db.query('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
   if (count.cnt > 0) return;
 
-  const insert = db.prepare(`
+  const insert = db.query(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -165,23 +178,22 @@ function seedModels(db: Database.Database) {
     ['minimax', 'MiniMax-M1', 'MiniMax M1', 5, 8, 'Large', 20, null, 1000000, null, '~30M', 200000],
   ];
 
-  const insertMany = db.transaction(() => {
-    for (const m of models) {
-      insert.run(...m);
-    }
-  });
-  insertMany();
+  runInTransaction(db, () => {
+      for (const m of models) {
+        insert.run(m);
+      }
+    });
 
-  // Seed default fallback config from models
-  const allModels = db.prepare('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as { id: number; intelligence_rank: number }[];
-  const insertFallback = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-  const insertFallbacks = db.transaction(() => {
-    for (let i = 0; i < allModels.length; i++) {
-      insertFallback.run(allModels[i].id, i + 1);
-    }
-  });
-  insertFallbacks();
+    // Seed default fallback config from models
+    const allModels = db.query('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as { id: number; intelligence_rank: number }[];
+    const insertFallback = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
 
+    // Ejecución de la segunda transacción usando el callback
+    runInTransaction(db, () => {
+      for (let i = 0; i < allModels.length; i++) {
+        insertFallback.run([allModels[i].id, i + 1]);
+      }
+    });
   console.log(`Seeded ${models.length} models and fallback config`);
 }
 
@@ -191,163 +203,177 @@ function seedModels(db: Database.Database) {
  * corrects stale rate-limits / monthly budgets, adds new smarter models
  * and three new providers (Zhipu, Moonshot, MiniMax).
  */
-function migrateModels(db: Database.Database) {
-  // 1) Replace outdated models in-place (preserves fallback_config & any references)
-  const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
-    // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
-  ];
-  const renameStmt = db.prepare(`
-    UPDATE models
-       SET model_id = ?, display_name = ?, intelligence_rank = ?,
-           monthly_token_budget = ?, rpd_limit = COALESCE(?, rpd_limit),
-           context_window = COALESCE(?, context_window),
-           size_label = COALESCE(?, size_label)
-     WHERE platform = ? AND model_id = ?
-  `);
-  // DeepSeek R1 (free) -> DeepSeek V3.1 (free)
-  renameStmt.run('deepseek/deepseek-v3.1:free', 'DeepSeek V3.1 (free)', 2, '~6M', 200, 131072, 'Frontier', 'openrouter', 'deepseek/deepseek-r1:free');
-  // GitHub GPT-4o -> GPT-5
-  renameStmt.run('openai/gpt-5', 'GPT-5 (GitHub)', 1, '~18M', null, 128000, 'Frontier', 'github', 'gpt-4o');
+ function migrateModels(db: Database) {
+   // 1) Replace outdated models in-place (preserves fallback_config & any references)
+   const renameStmt = db.query(`
+     UPDATE models
+        SET model_id = ?, display_name = ?, intelligence_rank = ?,
+            monthly_token_budget = ?, rpd_limit = COALESCE(?, rpd_limit),
+            context_window = COALESCE(?, context_window),
+            size_label = COALESCE(?, size_label)
+      WHERE platform = ? AND model_id = ?
+   `);
 
-  // 2) Correct stale limits / budgets on existing rows
-  db.prepare(`UPDATE models SET rpd_limit = 20, monthly_token_budget = '~3M' WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'`).run();
-  db.prepare(`UPDATE models SET rpm_limit = 20 WHERE platform = 'sambanova' AND model_id = 'Meta-Llama-3.3-70B-Instruct'`).run();
-  db.prepare(`UPDATE models SET tpm_limit = 6000 WHERE platform = 'groq' AND model_id = 'llama-4-scout-17b-16e-instruct'`).run();
-  db.prepare(`UPDATE models SET monthly_token_budget = '~1-2M' WHERE platform = 'cohere' AND model_id = 'command-r-plus-08-2024'`).run();
-  db.prepare(`UPDATE models SET monthly_token_budget = '~1-3M' WHERE platform = 'huggingface' AND model_id = 'accounts/fireworks/models/llama-v3p3-70b-instruct'`).run();
-  // NVIDIA moved to credit model — disable and label accordingly
-  db.prepare(`UPDATE models SET monthly_token_budget = 'credits-based', enabled = 0 WHERE platform = 'nvidia' AND model_id = 'meta/llama-3.1-70b-instruct'`).run();
+   // Ejecutamos las actualizaciones iniciales usando arrays directamente sin destructuring (...)
+   // DeepSeek R1 (free) -> DeepSeek V3.1 (free)
+   renameStmt.run(['deepseek/deepseek-v3.1:free', 'DeepSeek V3.1 (free)', 2, '~6M', 200, 131072, 'Frontier', 'openrouter', 'deepseek/deepseek-r1:free']);
+   // GitHub GPT-4o -> GPT-5
+   renameStmt.run(['openai/gpt-5', 'GPT-5 (GitHub)', 1, '~18M', null, 128000, 'Frontier', 'github', 'gpt-4o']);
 
-  // 3) Insert new models (UNIQUE(platform, model_id) makes this idempotent)
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+   // 2) Correct stale limits / budgets on existing rows
+   db.query(`UPDATE models SET rpd_limit = 20, monthly_token_budget = '~3M' WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'`).run();
+   db.query(`UPDATE models SET rpm_limit = 20 WHERE platform = 'sambanova' AND model_id = 'Meta-Llama-3.3-70B-Instruct'`).run();
+   db.query(`UPDATE models SET tpm_limit = 6000 WHERE platform = 'groq' AND model_id = 'llama-4-scout-17b-16e-instruct'`).run();
+   db.query(`UPDATE models SET monthly_token_budget = '~1-2M' WHERE platform = 'cohere' AND model_id = 'command-r-plus-08-2024'`).run();
+   db.query(`UPDATE models SET monthly_token_budget = '~1-3M' WHERE platform = 'huggingface' AND model_id = 'accounts/fireworks/models/llama-v3p3-70b-instruct'`).run();
+   // NVIDIA moved to credit model — disable and label accordingly
+   db.query(`UPDATE models SET monthly_token_budget = 'credits-based', enabled = 0 WHERE platform = 'nvidia' AND model_id = 'meta/llama-3.1-70b-instruct'`).run();
 
-  const newModels: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
-    // Cerebras — same free pool as qwen3-235b
-    ['cerebras', 'qwen-3-coder-480b', 'Qwen3-Coder 480B', 2, 1, 'Frontier', 30, null, 60000, 1000000, '~30M', 131072],
-    ['cerebras', 'llama-4-maverick-17b-128e-instruct', 'Llama 4 Maverick', 3, 1, 'Frontier', 30, null, 60000, 1000000, '~30M', 131072],
-    ['cerebras', 'gpt-oss-120b', 'GPT-OSS 120B', 3, 1, 'Large', 30, null, 60000, 1000000, '~30M', 131072],
-    // OpenRouter free tier
-    ['openrouter', 'deepseek/deepseek-v3.1:free', 'DeepSeek V3.1 (free)', 2, 10, 'Frontier', 20, 200, null, null, '~6M', 131072],
-    ['openrouter', 'moonshotai/kimi-k2:free', 'Kimi K2 (free)', 2, 9, 'Frontier', 20, 200, null, null, '~6M', 131072],
-    ['openrouter', 'qwen/qwen3-coder:free', 'Qwen3 Coder (free)', 3, 9, 'Frontier', 20, 200, null, null, '~6M', 262144],
-    ['openrouter', 'z-ai/glm-4.5-air:free', 'GLM-4.5 Air (free)', 4, 9, 'Large', 20, 200, null, null, '~6M', 131072],
-    // Mistral Experiment pool — shared ~1B/mo across models
-    ['mistral', 'magistral-medium-latest', 'Magistral Medium', 4, 8, 'Large', 2, null, 500000, null, '~50-100M', 40000],
-    ['mistral', 'codestral-latest', 'Codestral', 6, 6, 'Medium', 2, null, 500000, null, '~50-100M', 32000],
-    // New providers
-    ['zhipu', 'glm-4.5-flash', 'GLM-4.5 Flash', 5, 4, 'Large', null, null, null, 1000000, '~30M', 131072],
-    ['moonshot', 'kimi-latest', 'Kimi Latest', 4, 8, 'Large', 60, null, null, 500000, '~15M', 200000],
-    ['minimax', 'MiniMax-M1', 'MiniMax M1', 5, 8, 'Large', 20, null, 1000000, null, '~30M', 200000],
-  ];
+   // 3) Insert new models (UNIQUE(platform, model_id) makes this idempotent)
+   const insert = db.query(`
+     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   `);
 
-  const apply = db.transaction(() => {
-    for (const m of newModels) insert.run(...m);
+   const newModels: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
+     // Cerebras — same free pool as qwen3-235b
+     ['cerebras', 'qwen-3-coder-480b', 'Qwen3-Coder 480B', 2, 1, 'Frontier', 30, null, 60000, 1000000, '~30M', 131072],
+     ['cerebras', 'llama-4-maverick-17b-128e-instruct', 'Llama 4 Maverick', 3, 1, 'Frontier', 30, null, 60000, 1000000, '~30M', 131072],
+     ['cerebras', 'gpt-oss-120b', 'GPT-OSS 120B', 3, 1, 'Large', 30, null, 60000, 1000000, '~30M', 131072],
+     // OpenRouter free tier
+     ['openrouter', 'deepseek/deepseek-v3.1:free', 'DeepSeek V3.1 (free)', 2, 10, 'Frontier', 20, 200, null, null, '~6M', 131072],
+     ['openrouter', 'moonshotai/kimi-k2:free', 'Kimi K2 (free)', 2, 9, 'Frontier', 20, 200, null, null, '~6M', 131072],
+     ['openrouter', 'qwen/qwen3-coder:free', 'Qwen3 Coder (free)', 3, 9, 'Frontier', 20, 200, null, null, '~6M', 262144],
+     ['openrouter', 'z-ai/glm-4.5-air:free', 'GLM-4.5 Air (free)', 4, 9, 'Large', 20, 200, null, null, '~6M', 131072],
+     // Mistral Experiment pool — shared ~1B/mo across models
+     ['mistral', 'magistral-medium-latest', 'Magistral Medium', 4, 8, 'Large', 2, null, 500000, null, '~50-100M', 40000],
+     ['mistral', 'codestral-latest', 'Codestral', 6, 6, 'Medium', 2, null, 500000, null, '~50-100M', 32000],
+     // New providers
+     ['zhipu', 'glm-4.5-flash', 'GLM-4.5 Flash', 5, 4, 'Large', null, null, null, 1000000, '~30M', 131072],
+     ['moonshot', 'kimi-latest', 'Kimi Latest', 4, 8, 'Large', 60, null, null, 500000, '~15M', 200000],
+     ['minimax', 'MiniMax-M1', 'MiniMax M1', 5, 8, 'Large', 20, null, 1000000, null, '~30M', 200000],
+   ];
 
-    // Ensure every model has a fallback_config row (new inserts + any orphans)
-    const missing = db.prepare(`
-      SELECT m.id FROM models m
-      LEFT JOIN fallback_config f ON m.id = f.model_db_id
-      WHERE f.id IS NULL
-      ORDER BY m.intelligence_rank ASC
-    `).all() as { id: number }[];
-    if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFallback = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) {
-        addFallback.run(missing[i].id, maxPriority + i + 1);
-      }
-    }
-  });
-  apply();
-}
+   // Envolvemos el bloque pesado de inserciones y cálculos secundarios en el helper transaccional
+   runInTransaction(db, () => {
+     for (const m of newModels) {
+       insert.run(m); // Pasamos el array completo directamente
+     }
 
+     // Ensure every model has a fallback_config row (new inserts + any orphans)
+     const missing = db.query(`
+       SELECT m.id FROM models m
+       LEFT JOIN fallback_config f ON m.id = f.model_db_id
+       WHERE f.id IS NULL
+       ORDER BY m.intelligence_rank ASC
+     `).all() as { id: number }[];
+
+     if (missing.length > 0) {
+       const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+       const addFallback = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+       for (let i = 0; i < missing.length; i++) {
+         addFallback.run([missing[i].id, maxPriority + i + 1]); // Empaquetamos los dos argumentos en un array para tu binding nativo
+       }
+     }
+   });
+ }
 /**
  * Second-pass migration after live-testing every model against its provider.
  * Corrects model IDs verified wrong, removes models not actually available on
  * the current free tier, and adds real :free OpenRouter models found in the
  * live catalog (April 2026).
  */
-function migrateModelsV2(db: Database.Database) {
-  // Helper: delete a model and its fallback_config entry (FK is RESTRICT-by-default)
-  const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
-  const deleteFallback = db.prepare(`
-    DELETE FROM fallback_config WHERE model_db_id IN (
-      SELECT id FROM models WHERE platform = ? AND model_id = ?
-    )
-  `);
-  const removals: Array<[string, string]> = [
-    // GitHub free tier does NOT include GPT-5 (only catalog-listed). Revert handled below.
-    // Cerebras: qwen-3-coder-480b and llama-4-maverick not on free tier; gpt-oss-120b is listed
-    // but requires special access — our key gets 404. Remove all three.
-    ['cerebras', 'qwen-3-coder-480b'],
-    ['cerebras', 'llama-4-maverick-17b-128e-instruct'],
-    ['cerebras', 'gpt-oss-120b'],
-    // These OpenRouter :free variants do not exist in the live catalog (April 2026)
-    ['openrouter', 'deepseek/deepseek-v3.1:free'],
-    ['openrouter', 'moonshotai/kimi-k2:free'],
-  ];
-  const applyRemovals = db.transaction(() => {
-    for (const [p, m] of removals) {
-      deleteFallback.run(p, m);
-      deleteModel.run(p, m);
-    }
-  });
-  applyRemovals();
+ function migrateModelsV2(db: Database) {
+   // Helper: delete a model and its fallback_config entry (FK is RESTRICT-by-default)
+   const deleteModel = db.query(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
+   const deleteFallback = db.query(`
+     DELETE FROM fallback_config WHERE model_db_id IN (
+       SELECT id FROM models WHERE platform = ? AND model_id = ?
+     )
+   `);
 
-  // GitHub: gpt-5 is in the model catalog but returns "unavailable_model" on free tier
-  // inference. Revert to gpt-4o which works. This only runs if the gpt-5 row exists.
-  db.prepare(`
-    UPDATE models
-       SET model_id = 'gpt-4o', display_name = 'GPT-4o', intelligence_rank = 5,
-           size_label = 'Large', context_window = 8000, monthly_token_budget = '~18M'
-     WHERE platform = 'github' AND model_id = 'openai/gpt-5'
-  `).run();
+   const removals: Array<[string, string]> = [
+     // GitHub free tier does NOT include GPT-5 (only catalog-listed). Revert handled below.
+     // Cerebras: qwen-3-coder-480b and llama-4-maverick not on free tier; gpt-oss-120b is listed
+     // but requires special access — our key gets 404. Remove all three.
+     ['cerebras', 'qwen-3-coder-480b'],
+     ['cerebras', 'llama-4-maverick-17b-128e-instruct'],
+     ['cerebras', 'gpt-oss-120b'],
+     // These OpenRouter :free variants do not exist in the live catalog (April 2026)
+     ['openrouter', 'deepseek/deepseek-v3.1:free'],
+     ['openrouter', 'moonshotai/kimi-k2:free'],
+   ];
 
-  // Groq: scout requires the meta-llama/ publisher prefix
-  db.prepare(`
-    UPDATE models SET model_id = 'meta-llama/llama-4-scout-17b-16e-instruct'
-     WHERE platform = 'groq' AND model_id = 'llama-4-scout-17b-16e-instruct'
-  `).run();
+   // 1) Aplicamos las remociones dentro de una transacción controlada por nuestro helper
+   runInTransaction(db, () => {
+     for (const [p, m] of removals) {
+       // Pasamos los argumentos agrupados en un array ordenado
+       deleteFallback.run([p, m]);
+       deleteModel.run([p, m]);
+     }
+   });
 
-  // Add real OpenRouter :free models that exist in the live catalog
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
-    // Frontier-tier free models verified in OR catalog 2026-04
-    ['openrouter', 'nvidia/nemotron-3-super-120b-a12b:free', 'Nemotron 3 Super 120B (free)', 2, 9, 'Frontier', 20, 200, null, null, '~6M', 262144],
-    ['openrouter', 'qwen/qwen3-next-80b-a3b-instruct:free', 'Qwen3-Next 80B (free)', 3, 9, 'Large', 20, 200, null, null, '~6M', 262144],
-    ['openrouter', 'minimax/minimax-m2.5:free', 'MiniMax M2.5 (free)', 3, 9, 'Large', 20, 200, null, null, '~6M', 196608],
-    ['openrouter', 'google/gemma-4-31b-it:free', 'Gemma 4 31B (free)', 5, 9, 'Medium', 20, 200, null, null, '~6M', 262144],
-  ];
-  const applyAdditions = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    // Fallback entries for new models
-    const missing = db.prepare(`
-      SELECT m.id FROM models m
-      LEFT JOIN fallback_config f ON m.id = f.model_db_id
-      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
-    `).all() as { id: number }[];
-    if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
-    }
-  });
-  applyAdditions();
-}
+   // GitHub: gpt-5 is in the model catalog but returns "unavailable_model" on free tier
+   // inference. Revert to gpt-4o which works. This only runs if the gpt-5 row exists.
+   db.query(`
+     UPDATE models
+        SET model_id = 'gpt-4o', display_name = 'GPT-4o', intelligence_rank = 5,
+            size_label = 'Large', context_window = 8000, monthly_token_budget = '~18M'
+      WHERE platform = 'github' AND model_id = 'openai/gpt-5'
+   `).run();
 
+   // Groq: scout requires the meta-llama/ publisher prefix
+   db.query(`
+     UPDATE models SET model_id = 'meta-llama/llama-4-scout-17b-16e-instruct'
+      WHERE platform = 'groq' AND model_id = 'llama-4-scout-17b-16e-instruct'
+   `).run();
+
+   // Add real OpenRouter :free models that exist in the live catalog
+   const insert = db.query(`
+     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   `);
+
+   const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
+     // Frontier-tier free models verified in OR catalog 2026-04
+     ['openrouter', 'nvidia/nemotron-3-super-120b-a12b:free', 'Nemotron 3 Super 120B (free)', 2, 9, 'Frontier', 20, 200, null, null, '~6M', 262144],
+     ['openrouter', 'qwen/qwen3-next-80b-a3b-instruct:free', 'Qwen3-Next 80B (free)', 3, 9, 'Large', 20, 200, null, null, '~6M', 262144],
+     ['openrouter', 'minimax/minimax-m2.5:free', 'MiniMax M2.5 (free)', 3, 9, 'Large', 20, 200, null, null, '~6M', 196608],
+     ['openrouter', 'google/gemma-4-31b-it:free', 'Gemma 4 31B (free)', 5, 9, 'Medium', 20, 200, null, null, '~6M', 262144],
+   ];
+
+   // 2) Aplicamos las adiciones y recalculamos el fallback_config en otra transacción limpia
+   runInTransaction(db, () => {
+     for (const a of additions) {
+       insert.run(a); // Pasamos el array directamente
+     }
+
+     // Fallback entries for new models
+     const missing = db.query(`
+       SELECT m.id FROM models m
+       LEFT JOIN fallback_config f ON m.id = f.model_db_id
+       WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+     `).all() as { id: number }[];
+
+     if (missing.length > 0) {
+       const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+       const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+       for (let i = 0; i < missing.length; i++) {
+         // Envolvemos los dos parámetros primitivos en una tupla array para cumplir con la firma nativa
+         addFb.run([missing[i].id, maxPriority + i + 1]);
+       }
+     }
+   });
+ }
 /**
  * Re-rank intelligence based on April 2026 coding + agentic tool-use benchmarks:
  * SWE-bench Verified, Terminal-Bench 2, TAU-Bench, Aider Polyglot.
  * Higher rank = weaker. Ties are allowed (same weights across providers).
  */
-function migrateModelsV3Ranks(db: Database.Database) {
-  const setRank = db.prepare(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
+function migrateModelsV3Ranks(db: Database) {
+  const setRank = db.query(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
   const ranks: Array<[number, string, string]> = [
     // #1-10 frontier coders / agents
     [1,  'openrouter',  'minimax/minimax-m2.5:free'],                     // SWE-V ~80%, TB2 ~57%
@@ -381,12 +407,12 @@ function migrateModelsV3Ranks(db: Database.Database) {
     [22, 'cloudflare',  '@cf/meta/llama-3.1-70b-instruct'],               // same base weights
     [23, 'cohere',      'command-r-plus-08-2024'],                        // RAG-focused, weakest on code
   ];
-  const apply = db.transaction(() => {
-    for (const [rank, platform, modelId] of ranks) {
-      setRank.run(rank, platform, modelId);
-    }
-  });
-  apply();
+  runInTransaction(db, () => {
+      for (const [rank, platform, modelId] of ranks) {
+        // Empaquetamos las variables sueltas en una tupla array para cumplir con la API nativa de tu NAPI
+        setRank.run([rank, platform, modelId]);
+      }
+    });
 }
 
 /**
@@ -401,10 +427,10 @@ function migrateModelsV3Ranks(db: Database.Database) {
  * (no structured tools), OR/gemma-4 (weak at tools). Renames CF llama-3.1 → 3.3
  * fp8-fast. Corrects stale limits.
  */
-function migrateModelsV4(db: Database.Database) {
+function migrateModelsV4(db: Database) {
   // 1) Remove entries that are unavailable or fail agentic tool use
-  const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
-  const deleteFallback = db.prepare(`
+  const deleteModel = db.query(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
+  const deleteFallback = db.query(`
     DELETE FROM fallback_config WHERE model_db_id IN (
       SELECT id FROM models WHERE platform = ? AND model_id = ?
     )
@@ -415,16 +441,15 @@ function migrateModelsV4(db: Database.Database) {
     ['openrouter', 'google/gemma-4-31b-it:free'],                           // weak at tool use
     ['huggingface', 'accounts/fireworks/models/llama-v3p3-70b-instruct'],  // emits tool call as text content, not structured
   ];
-  const applyRemovals = db.transaction(() => {
-    for (const [p, m] of removals) {
-      deleteFallback.run(p, m);
-      deleteModel.run(p, m);
-    }
-  });
-  applyRemovals();
+  runInTransaction(db, () => {
+      for (const [p, m] of removals) {
+        deleteFallback.run([p, m]);
+        deleteModel.run([p, m]);
+      }
+    });
 
   // 2) Cloudflare: replace Llama 3.1 70B with the current-gen 3.3 70B fp8-fast
-  db.prepare(`
+  db.query(`
     UPDATE models
        SET model_id = '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
            display_name = 'Llama 3.3 70B fp8-fast (CF)',
@@ -433,16 +458,16 @@ function migrateModelsV4(db: Database.Database) {
   `).run();
 
   // 3) Field corrections verified via primary sources + live probe
-  db.prepare(`UPDATE models SET tpm_limit = 12000 WHERE platform = 'groq' AND model_id = 'llama-3.3-70b-versatile'`).run();
-  db.prepare(`UPDATE models SET rpd_limit = 20 WHERE platform = 'sambanova' AND model_id = 'Meta-Llama-3.3-70B-Instruct'`).run();
-  db.prepare(`UPDATE models SET rpd_limit = 14400 WHERE platform = 'cerebras' AND model_id = 'qwen-3-235b-a22b-instruct-2507'`).run();
-  db.prepare(`UPDATE models SET rpd_limit = 250, monthly_token_budget = '~25M' WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'`).run();
+  db.query(`UPDATE models SET tpm_limit = 12000 WHERE platform = 'groq' AND model_id = 'llama-3.3-70b-versatile'`).run();
+  db.query(`UPDATE models SET rpd_limit = 20 WHERE platform = 'sambanova' AND model_id = 'Meta-Llama-3.3-70B-Instruct'`).run();
+  db.query(`UPDATE models SET rpd_limit = 14400 WHERE platform = 'cerebras' AND model_id = 'qwen-3-235b-a22b-instruct-2507'`).run();
+  db.query(`UPDATE models SET rpd_limit = 250, monthly_token_budget = '~25M' WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'`).run();
   // gemini-2.5-pro is at-risk: April 2026 Google moved Pro-class off free tier in practice.
   // Our live probe hit "quota exceeded" immediately. Cut rpd in half to reduce 429 blast radius.
-  db.prepare(`UPDATE models SET rpd_limit = 50, monthly_token_budget = '~6M' WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
+  db.query(`UPDATE models SET rpd_limit = 50, monthly_token_budget = '~6M' WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
 
   // 4) Add live-probed, tool-capable models
-  const insert = db.prepare(`
+  const insert = db.query(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -483,24 +508,30 @@ function migrateModelsV4(db: Database.Database) {
     ['cloudflare', '@cf/meta/llama-4-scout-17b-16e-instruct', 'Llama 4 Scout (CF)',            12, 11, 'Large',    null, null, null, null, '~18-45M', 131072],
   ];
 
-  const apply = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    const missing = db.prepare(`
-      SELECT m.id FROM models m
-      LEFT JOIN fallback_config f ON m.id = f.model_db_id
-      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
-    `).all() as { id: number }[];
-    if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
-    }
-  });
-  apply();
+  runInTransaction(db, () => {
+      for (const a of additions) {
+        insert.run(a);
+      }
+
+      const missing = db.query(`
+        SELECT m.id FROM models m
+        LEFT JOIN fallback_config f ON m.id = f.model_db_id
+        WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+      `).all() as { id: number }[];
+
+      if (missing.length > 0) {
+        const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+        const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+        for (let i = 0; i < missing.length; i++) {
+          addFb.run([missing[i].id, maxPriority + i + 1]);
+        }
+      }
+    });
 
   // 5) Re-rank the live catalog by agentic tool-use capability (lower = smarter).
   //    Grounded in April 2026 SWE-Bench Verified + BFCL v3 + Tau-Bench numbers.
-  const setRank = db.prepare(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
+  const setRank = db.query(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
   const ranks: Array<[number, string, string]> = [
     [1,  'openrouter',  'minimax/minimax-m2.5:free'],
     [2,  'openrouter',  'qwen/qwen3-coder:free'],
@@ -544,10 +575,11 @@ function migrateModelsV4(db: Database.Database) {
     [27, 'cohere',      'command-r-plus-08-2024'],
     [28, 'groq',        'llama-3.1-8b-instant'],
   ];
-  const applyRanks = db.transaction(() => {
-    for (const [r, p, m] of ranks) setRank.run(r, p, m);
-  });
-  applyRanks();
+  runInTransaction(db, () => {
+      for (const [r, p, m] of ranks) {
+        setRank.run([r, p, m]);
+      }
+    });
 }
 
 /**
@@ -556,28 +588,36 @@ function migrateModelsV4(db: Database.Database) {
  * free tier but throttled to 10 RPM / 100 RPD due to high demand; context capped
  * at 8192 on free tier).
  */
-function migrateModelsV5(db: Database.Database) {
-  db.prepare(`UPDATE models SET enabled = 0 WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
+ function migrateModelsV5(db: Database) {
+   db.query(`UPDATE models SET enabled = 0 WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
 
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const apply = db.transaction(() => {
-    insert.run('cerebras', 'zai-glm-4.7', 'GLM-4.7 (Cerebras)', 7, 1, 'Frontier', 10, 100, null, null, '~3M', 8192);
-    const missing = db.prepare(`
-      SELECT m.id FROM models m
-      LEFT JOIN fallback_config f ON m.id = f.model_db_id
-      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
-    `).all() as { id: number }[];
-    if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
-    }
-  });
-  apply();
-}
+   const insert = db.query(`
+     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   `);
+
+   // Envolvemos el bloque de inserción y cálculo de fallback_config usando nuestro helper transaccional
+   runInTransaction(db, () => {
+     // Agrupamos los parámetros sueltos en un único array para tu binding nativo en Rust
+     insert.run(['cerebras', 'zai-glm-4.7', 'GLM-4.7 (Cerebras)', 7, 1, 'Frontier', 10, 100, null, null, '~3M', 8192]);
+
+     const missing = db.query(`
+       SELECT m.id FROM models m
+       LEFT JOIN fallback_config f ON m.id = f.model_db_id
+       WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+     `).all() as { id: number }[];
+
+     if (missing.length > 0) {
+       const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+       const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+       for (let i = 0; i < missing.length; i++) {
+         // Envolvemos también estos dos valores en una tupla array
+         addFb.run([missing[i].id, maxPriority + i + 1]);
+       }
+     }
+   });
+ }
 
 /**
  * V6: Live-probed against real free-tier keys on 2026-04-25.
@@ -597,10 +637,10 @@ function migrateModelsV5(db: Database.Database) {
  *     against the same 20 RPD pool, confirming free-tier eligibility)
  *   - 2 OpenRouter :free models with no expiration_date
  */
-function migrateModelsV6(db: Database.Database) {
+function migrateModelsV6(db: Database) {
   // 1) Remove confirmed-dead OR route
-  const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
-  const deleteFallback = db.prepare(`
+  const deleteModel = db.query(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
+  const deleteFallback = db.query(`
     DELETE FROM fallback_config WHERE model_db_id IN (
       SELECT id FROM models WHERE platform = ? AND model_id = ?
     )
@@ -608,26 +648,25 @@ function migrateModelsV6(db: Database.Database) {
   const removals: Array<[string, string]> = [
     ['openrouter', 'arcee-ai/trinity-large-preview:free'],
   ];
-  const applyRemovals = db.transaction(() => {
+  runInTransaction(db, () => {
     for (const [p, m] of removals) {
-      deleteFallback.run(p, m);
-      deleteModel.run(p, m);
+      deleteFallback.run([p, m]);
+      deleteModel.run([p, m]);
     }
   });
-  applyRemovals();
 
   // 2) Correct stale Google free-tier RPD numbers
-  db.prepare(`
+  db.query(`
     UPDATE models SET rpd_limit = 20, monthly_token_budget = '~3M'
      WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'
   `).run();
-  db.prepare(`
+  db.query(`
     UPDATE models SET rpd_limit = 20, monthly_token_budget = '~3M'
      WHERE platform = 'google' AND model_id = 'gemini-2.5-flash-lite'
   `).run();
 
   // 3) Add live-probed models
-  const insert = db.prepare(`
+  const insert = db.query(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -650,20 +689,27 @@ function migrateModelsV6(db: Database.Database) {
     ['openrouter', 'google/gemma-4-31b-it:free',                   'Gemma 4 31B (free)',             19, 9,  'Medium',   20, 200, null, null, '~6M', 262144],
     ['openrouter', 'liquid/lfm-2.5-1.2b-instruct:free',            'Liquid LFM 2.5 1.2B (free)',     30, 10, 'Small',    20, 200, null, null, '~6M', 32768],
   ];
-  const apply = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    const missing = db.prepare(`
-      SELECT m.id FROM models m
-      LEFT JOIN fallback_config f ON m.id = f.model_db_id
-      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
-    `).all() as { id: number }[];
-    if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
-    }
-  });
-  apply();
+  runInTransaction(db, () => {
+      for (const a of additions) {
+        insert.run(a); // Pasamos la tupla 'a' directamente sin desestructurar con ...
+      }
+
+      const missing = db.query(`
+        SELECT m.id FROM models m
+        LEFT JOIN fallback_config f ON m.id = f.model_db_id
+        WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+      `).all() as { id: number }[];
+
+      if (missing.length > 0) {
+        const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+        const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+        for (let i = 0; i < missing.length; i++) {
+          // Envolvemos los argumentos posicionales en un array plano
+          addFb.run([missing[i].id, maxPriority + i + 1]);
+        }
+      }
+    });
 }
 
 /**
@@ -675,9 +721,9 @@ function migrateModelsV6(db: Database.Database) {
  *   api.z.ai and open.bigmodel.cn keys.
  * HF and NVIDIA left as-is: HF still serves chat with current key; NVIDIA already disabled.
  */
-function migrateModelsV7(db: Database.Database) {
-  const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
-  const deleteFallback = db.prepare(`
+function migrateModelsV7(db: Database) {
+  const deleteModel = db.query(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
+  const deleteFallback = db.query(`
     DELETE FROM fallback_config WHERE model_db_id IN (
       SELECT id FROM models WHERE platform = ? AND model_id = ?
     )
@@ -685,15 +731,14 @@ function migrateModelsV7(db: Database.Database) {
   const removals: Array<[string, string]> = [
     ['openrouter', 'inclusionai/ling-2.6-flash:free'],
   ];
-  const applyRemovals = db.transaction(() => {
+  runInTransaction(db, () => {
     for (const [p, m] of removals) {
-      deleteFallback.run(p, m);
-      deleteModel.run(p, m);
+      deleteFallback.run([p, m]);
+      deleteModel.run([p, m]);
     }
-  });
-  applyRemovals();
+  })
 
-  const insert = db.prepare(`
+  const insert = db.query(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -711,20 +756,19 @@ function migrateModelsV7(db: Database.Database) {
     // Zhipu (Z.ai) — free pool. glm-4.7-flash quotas unpublished; mirror glm-4.5-flash row shape.
     ['zhipu',      'glm-4.7-flash',                                          'GLM-4.7 Flash',                            18, 4,  'Large',    null, null, null, 1000000, '~30M', 131072],
   ];
-  const apply = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    const missing = db.prepare(`
+  runInTransaction(db, () => {
+    for (const a of additions) insert.run(a);
+    const missing = db.query(`
       SELECT m.id FROM models m
       LEFT JOIN fallback_config f ON m.id = f.model_db_id
       WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
     `).all() as { id: number }[];
     if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+      const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run([missing[i].id, maxPriority + i + 1]);
     }
   });
-  apply();
 }
 
 /**
@@ -734,8 +778,8 @@ function migrateModelsV7(db: Database.Database) {
  * "Couldn't find valid service tier", so the 200s on these rows confirm free-tier
  * access. Cloudflare's @cf/* models share the 10K Neurons/day free pool.
  */
-function migrateModelsV8(db: Database.Database) {
-  const insert = db.prepare(`
+function migrateModelsV8(db: Database) {
+  const insert = db.query(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -747,20 +791,19 @@ function migrateModelsV8(db: Database.Database) {
     ['cloudflare', '@cf/moonshotai/kimi-k2.6',                  'Kimi K2.6 (CF)',                 2,  11, 'Frontier', null, null, null, null, '~10-20M', 262144],
     ['cloudflare', '@cf/ibm-granite/granite-4.0-h-micro',       'Granite 4.0 H Micro (CF)',       29, 11, 'Small',    null, null, null, null, '~5-10M',  131072],
   ];
-  const apply = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    const missing = db.prepare(`
+  runInTransaction(db, () => {
+    for (const a of additions) insert.run(a);
+    const missing = db.query(`
       SELECT m.id FROM models m
       LEFT JOIN fallback_config f ON m.id = f.model_db_id
       WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
     `).all() as { id: number }[];
     if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+      const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run([missing[i].id, maxPriority + i + 1]);
     }
   });
-  apply();
 }
 
 /**
@@ -771,8 +814,8 @@ function migrateModelsV8(db: Database.Database) {
  * zai-glm-4.7 due to high demand. Row kept (not deleted) so it can be
  * re-enabled later without losing fallback_config history.
  */
-function migrateModelsV9(db: Database.Database) {
-  db.prepare(
+function migrateModelsV9(db: Database) {
+  db.query(
     "UPDATE models SET enabled = 0 WHERE platform = 'cerebras' AND model_id = 'zai-glm-4.7'"
   ).run();
 }
@@ -791,8 +834,8 @@ function migrateModelsV9(db: Database.Database) {
  * Quota shape: GPU-time, not tokens. monthly_token_budget reflects rough
  * Free-tier "session" capacity rather than a hard token cap.
  */
-function migrateModelsV10(db: Database.Database) {
-  const insert = db.prepare(`
+function migrateModelsV10(db: Database) {
+  const insert = db.query(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -812,20 +855,19 @@ function migrateModelsV10(db: Database.Database) {
     ['ollama', 'gpt-oss:20b',          'GPT-OSS 20B (Ollama)',         18, 10, 'Medium',   null, null, null, null, '~20-30M', 131072],
     ['ollama', 'gemma4:31b',           'Gemma 4 31B (Ollama)',         22, 10, 'Medium',   null, null, null, null, '~20-30M', 131072],
   ];
-  const apply = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    const missing = db.prepare(`
+  runInTransaction(db, () => {
+    for (const a of additions) insert.run(a);
+    const missing = db.query(`
       SELECT m.id FROM models m
       LEFT JOIN fallback_config f ON m.id = f.model_db_id
       WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
     `).all() as { id: number }[];
     if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+      const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run([missing[i].id, maxPriority + i + 1]);
     }
   });
-  apply();
 }
 
 /**
@@ -848,23 +890,23 @@ function migrateModelsV10(db: Database.Database) {
  *    please pay with fiat or send tao". The "free" tier requires a paid
  *    balance, which conflicts with the no-card criterion.
  */
-function migrateModelsV11(db: Database.Database) {
+function migrateModelsV11(db: Database) {
   // 1) Rename cerebras qwen3-235b → qwen-3-235b-a22b-instruct-2507 if the
   //    old id still exists on this DB. Safe to re-run because of the WHERE.
-  db.prepare(`
+  db.query(`
     UPDATE models SET model_id = 'qwen-3-235b-a22b-instruct-2507'
      WHERE platform = 'cerebras' AND model_id = 'qwen3-235b'
   `).run();
 
   // 2) Re-enable NVIDIA NIM (still has 1,000+ starter credits free-tier).
-  db.prepare(`
+  db.query(`
     UPDATE models SET enabled = 1, monthly_token_budget = '~3M (1k credits)'
      WHERE platform = 'nvidia' AND model_id = 'meta/llama-3.1-70b-instruct'
   `).run();
 
   // 3) Add catalog rows for the four new platforms. Numeric limits are
   //    conservative — provider docs publish best-effort bounds that fluctuate.
-  const insert = db.prepare(`
+  const insert = db.query(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -913,40 +955,39 @@ function migrateModelsV11(db: Database.Database) {
     ['llm7',         'GLM-4.6V-Flash',                            'GLM-4.6V Flash (LLM7)',         15, 9,  'Large',    100, null, null, null, '~2-3M (100/hr)', 131072],
   ];
 
-  const apply = db.transaction(() => {
-    for (const a of additions) insert.run(...a);
-    const missing = db.prepare(`
+  runInTransaction(db, () => {
+    for (const a of additions) insert.run(a);
+    const missing = db.query(`
       SELECT m.id FROM models m
       LEFT JOIN fallback_config f ON m.id = f.model_db_id
       WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
     `).all() as { id: number }[];
     if (missing.length > 0) {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
-      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+      const maxPriority = (db.query('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.query('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run([missing[i].id, maxPriority + i + 1]);
     }
-  });
-  apply();
+  })
 }
 
-function ensureUnifiedKey(db: Database.Database) {
-  const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
+function ensureUnifiedKey(db: Database) {
+  const existing = db.query("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
   if (!existing) {
     const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
-    db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
+    db.query("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
     console.log(`\n  Your unified API key: ${key}\n`);
   }
 }
 
 export function getUnifiedApiKey(): string {
   const db = getDb();
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
+  const row = db.query("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
   return row.value;
 }
 
 export function regenerateUnifiedKey(): string {
   const db = getDb();
   const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
-  db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
+  db.query("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
   return key;
 }

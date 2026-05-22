@@ -36,8 +36,8 @@ describe('Full Integration Flow', () => {
     app = createApp();
     // Clean
     const db = getDb();
-    db.prepare('DELETE FROM api_keys').run();
-    db.prepare('DELETE FROM requests').run();
+    db.query('DELETE FROM api_keys').run();
+    db.query('DELETE FROM requests').run();
   });
 
   it('Step 1: Verify models are seeded', async () => {

@@ -24,7 +24,7 @@ const addKeySchema = z.object({
 // List all keys (masked)
 keysRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
-  const rows = db.prepare('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
+  const rows = db.query('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
 
   const keys = rows.map(row => {
     let maskedKey = '****';
@@ -61,10 +61,10 @@ keysRouter.post('/', (req: Request, res: Response) => {
   const { encrypted, iv, authTag } = encrypt(key);
 
   const db = getDb();
-  const result = db.prepare(`
+  const result = db.query(`
     INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
     VALUES (?, ?, ?, ?, ?, 'unknown', 1)
-  `).run(platform, label ?? '', encrypted, iv, authTag);
+  `).run([platform, label ?? '', encrypted, iv, authTag]);
 
   res.status(201).json({
     id: result.lastInsertRowid,
@@ -85,7 +85,7 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const result = db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+  const result = db.query('DELETE FROM api_keys WHERE id = ?').run(id);
 
   if (result.changes === 0) {
     res.status(404).json({ error: { message: 'Key not found' } });
@@ -110,7 +110,7 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
+  const result = db.query('UPDATE api_keys SET enabled = ? WHERE id = ?').run([enabled ? 1 : 0, id]);
 
   if (result.changes === 0) {
     res.status(404).json({ error: { message: 'Key not found' } });

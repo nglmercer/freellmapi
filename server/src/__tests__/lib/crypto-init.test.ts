@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import Database from 'better-sqlite3';
+import {Database} from 'sqlite-napi';
 import { initEncryptionKey, encrypt, decrypt } from '../../lib/crypto.js';
 
-function freshDb(): Database.Database {
+function freshDb(): Database {
   const db = new Database(':memory:');
   db.exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
   return db;
@@ -45,20 +45,20 @@ describe('initEncryptionKey — input validation', () => {
     const db = freshDb();
     expect(() => initEncryptionKey(db)).not.toThrow();
     // Fell through to generation — DB now has a key.
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
+    const row = db.query("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
     expect(row.value).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('throws on a corrupted DB-stored key', () => {
     const db = freshDb();
-    db.prepare("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)").run('not-hex');
+    db.query("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)").run('not-hex');
     expect(() => initEncryptionKey(db)).toThrow(/Invalid ENCRYPTION_KEY \(db\)/);
   });
 
   it('generates a fresh key on a virgin DB and persists it', () => {
     const db = freshDb();
     initEncryptionKey(db);
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
+    const row = db.query("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
     expect(row.value).toMatch(/^[0-9a-f]{64}$/);
   });
 });

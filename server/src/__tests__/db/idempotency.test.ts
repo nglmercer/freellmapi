@@ -15,11 +15,11 @@ describe('Migration idempotency', () => {
 
     const db1 = initDb(tmpPath);
     const before = {
-      models: (db1.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
-      fallback: (db1.prepare('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
-      enabledModels: (db1.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
-      disabledModels: (db1.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
-      orphanFallbacks: (db1.prepare(`
+      models: (db1.query('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
+      fallback: (db1.query('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
+      enabledModels: (db1.query('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
+      disabledModels: (db1.query('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
+      orphanFallbacks: (db1.query(`
         SELECT COUNT(*) AS c FROM fallback_config f
         LEFT JOIN models m ON f.model_db_id = m.id
         WHERE m.id IS NULL
@@ -30,11 +30,11 @@ describe('Migration idempotency', () => {
     // Re-init the same DB file — V1..V9 should all no-op idempotently.
     const db2 = initDb(tmpPath);
     const after = {
-      models: (db2.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
-      fallback: (db2.prepare('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
-      enabledModels: (db2.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
-      disabledModels: (db2.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
-      orphanFallbacks: (db2.prepare(`
+      models: (db2.query('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
+      fallback: (db2.query('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
+      enabledModels: (db2.query('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
+      disabledModels: (db2.query('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
+      orphanFallbacks: (db2.query(`
         SELECT COUNT(*) AS c FROM fallback_config f
         LEFT JOIN models m ON f.model_db_id = m.id
         WHERE m.id IS NULL
@@ -50,7 +50,7 @@ describe('Migration idempotency', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     const db = initDb(':memory:');
 
-    const rows = db.prepare(`
+    const rows = db.query(`
       SELECT m.id, COUNT(f.id) AS fb_count
         FROM models m
         LEFT JOIN fallback_config f ON m.id = f.model_db_id
@@ -65,7 +65,7 @@ describe('Migration idempotency', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     const db = initDb(':memory:');
 
-    const dups = db.prepare(`
+    const dups = db.query(`
       SELECT platform, model_id, COUNT(*) AS c FROM models
        GROUP BY platform, model_id
       HAVING COUNT(*) > 1
@@ -79,7 +79,7 @@ describe('Migration idempotency', () => {
     const db = initDb(':memory:');
     const { hasProvider } = await import('../../providers/index.js');
 
-    const platforms = (db.prepare(
+    const platforms = (db.query(
       `SELECT DISTINCT platform FROM models WHERE enabled = 1`
     ).all() as { platform: any }[]).map(r => r.platform);
 

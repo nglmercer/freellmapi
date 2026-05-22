@@ -1,17 +1,9 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
-
+import { Database } from 'sqlite-napi'; // Tu librería nativa
 const ALGORITHM = 'aes-256-gcm';
 
 let cachedKey: Buffer | null = null;
 
-/**
- * AES-256-GCM uses a 32-byte key, hex-encoded as 64 chars.
- * A typo'd ENCRYPTION_KEY (e.g. "abc") would historically fall through
- * the placeholder check, get truncated to 1.5 bytes, and only fail at
- * the first encrypt() call with a cryptic node:crypto error. Validate
- * the length up front and fail fast with an actionable message.
- */
 const KEY_BYTES = 32;
 const KEY_HEX_LEN = KEY_BYTES * 2;
 
@@ -27,9 +19,9 @@ function parseHexKey(value: string, source: 'env' | 'db'): Buffer {
 
 /**
  * Initialize encryption key from env, DB, or generate a new one.
- * Must be called after DB is initialized.
+ * Confeccionado para usar los métodos específicos de tu sqlite-napi.
  */
-export function initEncryptionKey(db: Database.Database): void {
+export function initEncryptionKey(db: Database): void {
   // 1. Check env var
   const envKey = process.env.ENCRYPTION_KEY;
   if (envKey && envKey !== 'your-64-char-hex-key-here') {
@@ -38,7 +30,8 @@ export function initEncryptionKey(db: Database.Database): void {
   }
 
   // 2. Check DB for persisted key
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string } | undefined;
+  // Cambiado: db.query(...) -> db.query(...)
+  const row = db.query("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string } | undefined;
   if (row) {
     cachedKey = parseHexKey(row.value, 'db');
     return;
@@ -46,7 +39,11 @@ export function initEncryptionKey(db: Database.Database): void {
 
   // 3. Generate and persist
   cachedKey = crypto.randomBytes(KEY_BYTES);
-  db.prepare("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)").run(cachedKey.toString('hex'));
+
+  // Cambiado: db.query(...) -> db.query(...)
+  // Pasamos el argumento directamente al método .run(...) del Statement de tu NAPI
+  db.query("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)")
+    .run(cachedKey.toString('hex'));
 }
 
 function getEncryptionKey(): Buffer {

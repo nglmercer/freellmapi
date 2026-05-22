@@ -21,7 +21,7 @@ interface Key {
   auth_tag: string;
 }
 
-const models = db.prepare(`
+const models = db.query(`
   SELECT m.id, m.platform, m.model_id, m.display_name
     FROM models m
    WHERE m.enabled = 1
@@ -29,7 +29,7 @@ const models = db.prepare(`
    ORDER BY m.intelligence_rank, m.platform
 `).all() as Row[];
 
-const keyStmt = db.prepare(`
+const keyStmt = db.query(`
   SELECT encrypted_key, iv, auth_tag FROM api_keys
    WHERE platform = ? AND enabled = 1 ORDER BY id LIMIT 1
 `);

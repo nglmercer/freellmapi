@@ -135,7 +135,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   const db = getDb();
 
   // Get fallback chain ordered by priority
-  const fallbackChain = db.prepare(`
+  const fallbackChain = db.query(`
     SELECT fc.model_db_id, fc.priority, fc.enabled
     FROM fallback_config fc
     ORDER BY fc.priority ASC
@@ -160,7 +160,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     if (!entry.enabled) continue;
 
     // Get model details
-    const model = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(entry.model_db_id) as ModelRow | undefined;
+    const model = db.query('SELECT * FROM models WHERE id = ? AND enabled = 1').get(entry.model_db_id) as ModelRow | undefined;
     if (!model) continue;
 
     // Check if we have a provider for this platform
@@ -168,9 +168,9 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     if (!provider) continue;
 
     // Get all healthy, enabled keys for this platform
-    const keys = db.prepare(
+    const keys = db.query(
       'SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status != ?'
-    ).all(model.platform, 'invalid') as KeyRow[];
+    ).all([model.platform, 'invalid']) as KeyRow[];
 
     if (keys.length === 0) continue;
 
@@ -217,9 +217,9 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // If we reach here, this specific model has NO available keys.
     // Update round-robin index even if we failed so we don't get stuck.
     roundRobinIndex.set(rrKey, idx);
-    
-    // We don't explicitly penalize the model here because the fact that we 
-    // couldn't find a key means we will naturally move to the next model 
+
+    // We don't explicitly penalize the model here because the fact that we
+    // couldn't find a key means we will naturally move to the next model
     // in the `sortedChain` for THIS specific request.
   }
 

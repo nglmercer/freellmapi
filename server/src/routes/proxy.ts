@@ -84,7 +84,7 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
 // OpenAI-compatible /models endpoint (used by Hermes for metadata)
 proxyRouter.get('/models', (_req: Request, res: Response) => {
   const db = getDb();
-  const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
+  const models = db.query('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
   res.json({
     object: 'list',
     data: [
@@ -280,11 +280,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
     const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    const enabled = db.query('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
     if (enabled) {
       preferredModel = enabled.id;
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      const disabled = db.query('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
       const reason = disabled ? 'is disabled' : 'is not in the catalog';
       res.status(400).json({
         error: {
@@ -451,10 +451,10 @@ function logRequest(
 ) {
   try {
     const db = getDb();
-    db.prepare(`
+    db.query(`
       INSERT INTO requests (platform, model_id, status, input_tokens, output_tokens, latency_ms, error)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, status, inputTokens, outputTokens, latencyMs, error);
+    `).run([platform, modelId, status, inputTokens, outputTokens, latencyMs, error]);
   } catch (e) {
     console.error('Failed to log request:', e);
   }

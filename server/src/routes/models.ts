@@ -8,7 +8,7 @@ export const modelsRouter = Router();
 // List all models with availability info
 modelsRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
-  const models = db.prepare(`
+  const models = db.query(`
     SELECT m.*, fc.priority, fc.enabled as fallback_enabled
     FROM models m
     LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
@@ -16,7 +16,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
   `).all() as any[];
 
   // Count keys per platform
-  const keyCounts = db.prepare(`
+  const keyCounts = db.query(`
     SELECT platform, COUNT(*) as count
     FROM api_keys
     WHERE enabled = 1

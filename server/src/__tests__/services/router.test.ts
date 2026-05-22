@@ -11,12 +11,12 @@ describe('Router', () => {
 
   beforeEach(() => {
     const db = getDb();
-    db.prepare('DELETE FROM api_keys').run();
+    db.query('DELETE FROM api_keys').run();
     // Reset fallback order to intelligence ranking
-    const models = db.prepare('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as any[];
-    const update = db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
+    const models = db.query('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as any[];
+    const update = db.query('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
     for (let i = 0; i < models.length; i++) {
-      update.run(i + 1, models[i].id);
+      update.run([i + 1, models[i].id]);
     }
   });
 
@@ -27,10 +27,10 @@ describe('Router', () => {
   it('should route to highest priority model with available key', () => {
     const db = getDb();
     const { encrypted, iv, authTag } = encrypt('test-groq-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('groq', 'test', encrypted, iv, authTag, 'healthy', 1);
+    `).run(['groq', 'test', encrypted, iv, authTag, 'healthy', 1]);
 
     const result = routeRequest();
     expect(result.platform).toBe('groq');
@@ -41,16 +41,16 @@ describe('Router', () => {
     const db = getDb();
 
     const googleKey = encrypt('test-google-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('google', 'test', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 1);
+    `).run(['google', 'test', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 1]);
 
     const groqKey = encrypt('test-groq-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+    `).run(['groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1]);
 
     // Post-V6: Google's gemini-3.1-pro-preview (rank 1, free-tier-eligible per
     // probe on 2026-04-25) outranks Groq's best free-tier model openai/gpt-oss-120b
@@ -63,16 +63,16 @@ describe('Router', () => {
     const db = getDb();
 
     const googleKey = encrypt('test-google-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('google', 'disabled', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 0);
+    `).run(['google', 'disabled', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 0]);
 
     const groqKey = encrypt('test-groq-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+    `).run(['groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1]);
 
     const result = routeRequest();
     expect(result.platform).toBe('groq');
@@ -82,16 +82,16 @@ describe('Router', () => {
     const db = getDb();
 
     const invalidKey = encrypt('invalid-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('google', 'invalid', invalidKey.encrypted, invalidKey.iv, invalidKey.authTag, 'invalid', 1);
+    `).run(['google', 'invalid', invalidKey.encrypted, invalidKey.iv, invalidKey.authTag, 'invalid', 1]);
 
     const groqKey = encrypt('test-groq-key');
-    db.prepare(`
+    db.query(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+    `).run(['groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1]);
 
     const result = routeRequest();
     expect(result.platform).toBe('groq');

@@ -25,7 +25,7 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
   const since = getSinceTimestamp(range);
   const db = getDb();
 
-  const stats = db.prepare(`
+  const stats = db.query(`
     SELECT
       COUNT(*) as total_requests,
       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
@@ -60,7 +60,7 @@ analyticsRouter.get('/by-model', (req: Request, res: Response) => {
   const since = getSinceTimestamp(range);
   const db = getDb();
 
-  const rows = db.prepare(`
+  const rows = db.query(`
     SELECT
       r.platform,
       r.model_id,
@@ -95,7 +95,7 @@ analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
   const since = getSinceTimestamp(range);
   const db = getDb();
 
-  const rows = db.prepare(`
+  const rows = db.query(`
     SELECT
       platform,
       COUNT(*) as requests,
@@ -129,7 +129,7 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
   // dateFormat is a hardcoded whitelist — never user-controlled.
   const dateFormat = interval === 'hour' ? '%Y-%m-%dT%H:00:00' : '%Y-%m-%d';
 
-  const rows = db.prepare(`
+  const rows = db.query(`
     SELECT
       strftime('${dateFormat}', created_at) as timestamp,
       COUNT(*) as requests,
@@ -156,7 +156,7 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   const db = getDb();
 
   // Group errors by category (extract the key part of the error message)
-  const rows = db.prepare(`
+  const rows = db.query(`
     SELECT
       platform,
       model_id,
@@ -178,7 +178,7 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   `).all(since) as any[];
 
   // Also get totals by category
-  const byCategory = db.prepare(`
+  const byCategory = db.query(`
     SELECT
       CASE
         WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
@@ -198,7 +198,7 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   `).all(since) as any[];
 
   // Errors by platform
-  const byPlatform = db.prepare(`
+  const byPlatform = db.query(`
     SELECT platform, COUNT(*) as count
     FROM requests
     WHERE status = 'error' AND created_at >= ?
@@ -219,7 +219,7 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
   const since = getSinceTimestamp(range);
   const db = getDb();
 
-  const rows = db.prepare(`
+  const rows = db.query(`
     SELECT id, platform, model_id, error, latency_ms, created_at
     FROM requests
     WHERE status = 'error' AND created_at >= ?

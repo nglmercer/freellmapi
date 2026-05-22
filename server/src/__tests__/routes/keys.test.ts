@@ -30,7 +30,7 @@ describe('Keys API', () => {
 
   beforeEach(() => {
     const db = getDb();
-    db.prepare('DELETE FROM api_keys').run();
+    db.query('DELETE FROM api_keys').run();
   });
 
   it('GET /api/keys returns empty array initially', async () => {

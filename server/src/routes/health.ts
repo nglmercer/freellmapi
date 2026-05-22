@@ -10,7 +10,7 @@ export const healthRouter = Router();
 healthRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
 
-  const platforms = db.prepare(`
+  const platforms = db.query(`
     SELECT
       platform,
       COUNT(*) as total_keys,
@@ -24,7 +24,7 @@ healthRouter.get('/', (_req: Request, res: Response) => {
     GROUP BY platform
   `).all() as any[];
 
-  const keys = db.prepare(`
+  const keys = db.query(`
     SELECT id, platform, label, status, enabled, created_at, last_checked_at
     FROM api_keys
     ORDER BY platform, created_at DESC
